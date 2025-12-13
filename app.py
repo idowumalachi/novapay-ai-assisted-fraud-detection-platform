@@ -7,7 +7,7 @@ Original file is located at
     https://colab.research.google.com/drive/1YQ6j3gufoMKB8i4g5rY2-tXoFsbOG4WU
 """
 
-# app.py — NovaPay Fraud Defense Platform (Random Forest)
+# app.py — NovaPay Fraud Detection Platform (Random Forest)
 import os
 import json
 from pathlib import Path
@@ -36,7 +36,7 @@ FEATURES_PATH = MODELS_DIR / "rf_features.json"
 # ----------------------------
 # UI Config
 # ----------------------------
-st.set_page_config(page_title="NovaPay | AI Fraud Defense", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="NovaPay | AI Fraud Detection", page_icon="🛡️", layout="wide")
 
 
 CUSTOM_CSS = """
@@ -325,7 +325,7 @@ if page == "🏠 Dashboard":
         """
         <div class="hero">
           <span class="badge">AI-Assisted Fraud Defense</span>
-          <h1>🛡️ NovaPay Fraud Defense Platform</h1>
+          <h1>🛡️ NovaPay Fraud Detection Platform</h1>
           <div class="smallmuted">
             Upload transactions • Score fraud probability • Explain decisions • Monitor risk
           </div>
