@@ -148,6 +148,7 @@ The system is deployed as a **Streamlit web application** with:
 - Adjustable decision threshold
 - Model insights and feature importance
 - Dark AI-themed dashboard UI
+- https://novapay-ai-assisted-fraud-detection-platform-ja3dgckcyfdlb5qlg.streamlit.app/
 
 ---
 
