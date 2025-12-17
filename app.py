@@ -115,8 +115,8 @@ def prepare_features_for_model(df: pd.DataFrame, target: str = "is_fraud"):
     X = df.drop(columns=[target])
 
     # ID columns should NOT be used as model features
-      ID_COLS = ["transaction_id", "txn_id", "transactionId", "TransactionID"]
-      X = X.drop(columns=[c for c in ID_COLS if c in X.columns], errors="ignore")
+    ID_COLS = ["transaction_id", "txn_id", "transactionId", "TransactionID"]
+    X = X.drop(columns=[c for c in ID_COLS if c in X.columns], errors="ignore")
 
 
     # Handle timestamp -> time features
@@ -186,9 +186,9 @@ def risk_tier(prob: float) -> str:
 
 def score_df(df_in: pd.DataFrame, model, features: list[str], threshold: float):
     df = df_in.copy()
-
     ID_COLS = ["transaction_id", "txn_id", "transactionId", "TransactionID"]
     df = df.drop(columns=[c for c in ID_COLS if c in df.columns], errors="ignore")
+
 
     # If user uploads raw data with timestamp/categoricals, we must encode it
     # similarly to training (but WITHOUT target)
