@@ -7,17 +7,13 @@ Original file is located at
     https://colab.research.google.com/drive/18vUVb6sf8RzXJe6hiWm92Cr_vAqrhpPH
 """
 
-# app.py  — NovaPay Fraud Defense Platform (FAST + FIXED)
-# ------------------------------------------------------
-# Requires:
-#   Models/rf_fraud_model.joblib
-#   Models/rf_features.json     (list of training feature columns)
-# Optional:
-#   shap_values_rf.npy
-#   X_test_for_shap.csv
-#
-# Run:
-#   streamlit run app.py
+# app.py — NovaPay Fraud Defense Platform (Single-file, Fast, Robust)
+# Author: Idowu Malachi (NovaPay project)
+# Notes:
+# - No utils.py required
+# - Handles timestamp strings safely
+# - Aligns scoring features to training features (prevents Streamlit Cloud feature-name errors)
+# - Uses caching to speed up app
 
 import os
 import json
@@ -30,26 +26,39 @@ import joblib
 
 import matplotlib.pyplot as plt
 
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    precision_recall_curve,
+    roc_auc_score,
+    average_precision_score,
+)
+
 # ----------------------------
 # Paths
 # ----------------------------
 APP_DIR = Path(__file__).parent
 DATA_DIR = APP_DIR / "Data"
 MODELS_DIR = APP_DIR / "Models"
+MODELS_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(exist_ok=True)
 
 MODEL_PATH = MODELS_DIR / "rf_fraud_model.joblib"
 FEATURES_PATH = MODELS_DIR / "rf_features.json"
 
-SHAP_PATH = APP_DIR / "shap_values_rf.npy"
-XTEST_PATH = APP_DIR / "X_test_for_shap.csv"
-
+SHAP_VALUES_PATH = MODELS_DIR / "shap_values_rf.npy"
+XTEST_FOR_SHAP_PATH = MODELS_DIR / "X_test_for_shap.csv"
 
 # ----------------------------
-# Premium UI CSS
+# UI Setup
 # ----------------------------
+st.set_page_config(page_title="NovaPay | AI Fraud Defense", page_icon="🛡️", layout="wide")
+
 CUSTOM_CSS = """
 <style>
-.block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1250px; }
+.block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
 div[data-testid="stSidebarContent"] { padding-top: 1rem; }
 
 .hero {
@@ -58,8 +67,7 @@ div[data-testid="stSidebarContent"] { padding-top: 1rem; }
   background: linear-gradient(135deg, rgba(79,70,229,0.25), rgba(16,185,129,0.12));
   border: 1px solid rgba(255,255,255,0.08);
 }
-.hero h1 { margin: 0.2rem 0 0.2rem 0; }
-
+.hero h1 { margin-bottom: 0.2rem; }
 .badge {
   display: inline-block;
   padding: 6px 10px;
@@ -77,6 +85,9 @@ div[data-testid="stSidebarContent"] { padding-top: 1rem; }
 }
 .card h3, .panel h3 { margin-top: 0; }
 
+.smallmuted { opacity: 0.8; font-size: 13px; }
+hr.soft { border:none; height:1px; background:rgba(255,255,255,0.08); margin:12px 0; }
+
 .kpi-grid { display:flex; gap:12px; flex-wrap:wrap; margin-top:10px; }
 .kpi-card{
   flex: 1 1 160px;
@@ -89,113 +100,284 @@ div[data-testid="stSidebarContent"] { padding-top: 1rem; }
 .kpi-value{ font-size:22px; font-weight:700; }
 .kpi-sub{ font-size:12px; opacity:0.8; }
 
-.smallmuted { opacity: 0.8; font-size: 13px; }
-hr.soft { border:none; height:1px; background:rgba(255,255,255,0.08); margin:12px 0; }
-
 .tag{
   display:inline-block;
+  margin-right:8px;
   padding:6px 10px;
   border-radius:999px;
   font-size:12px;
-  margin-right:6px;
   background:rgba(255,255,255,0.08);
   border:1px solid rgba(255,255,255,0.10);
 }
+
+.section-title {
+  font-size: 20px;
+  font-weight: 700;
+  margin-top: 8px;
+}
 </style>
 """
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# ----------------------------
+# Feature Engineering (robust)
+# ----------------------------
+def featurize(df: pd.DataFrame, training_columns: list[str] | None = None, target: str = "is_fraud"):
+    """
+    Convert raw/engineered dataset into model-ready numeric features:
+    - safely expands timestamp into hour/dayofweek/month/is_weekend
+    - drops original timestamp
+    - one-hot encodes categoricals
+    - fills inf/nan
+    - aligns columns to training_columns (adds missing as 0, drops extras, reorders)
+    Returns:
+        X (DataFrame), y (Series or None)
+    """
+    df = df.copy()
+
+    y = None
+    if target in df.columns:
+        y = df[target].astype(int)
+        df = df.drop(columns=[target])
+
+    # Timestamp handling (fixes "could not convert string to float: '2023-...+00:00'")
+    ts_col_candidates = [c for c in ["timestamp", "txn_time", "transaction_time"] if c in df.columns]
+    if ts_col_candidates:
+        col = ts_col_candidates[0]
+        ts = pd.to_datetime(df[col], errors="coerce", utc=True)
+        df["hour"] = ts.dt.hour.fillna(0).astype(int)
+        df["dayofweek"] = ts.dt.dayofweek.fillna(0).astype(int)
+        df["month"] = ts.dt.month.fillna(0).astype(int)
+        df["is_weekend"] = (df["dayofweek"] >= 5).astype(int)
+        df = df.drop(columns=[col])
+
+    # Convert booleans to int
+    bool_cols = df.select_dtypes(include=["bool"]).columns
+    for c in bool_cols:
+        df[c] = df[c].astype(int)
+
+    # One-hot encode categoricals
+    obj_cols = df.select_dtypes(include=["object"]).columns
+    if len(obj_cols) > 0:
+        df = pd.get_dummies(df, columns=list(obj_cols), drop_first=False)
+
+    # Force numeric + clean
+    df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    # Align to training columns if provided
+    if training_columns is not None:
+        # add missing
+        for c in training_columns:
+            if c not in df.columns:
+                df[c] = 0
+        # drop extras
+        df = df[training_columns]
+
+    return df, y
 
 
 # ----------------------------
-# Fast model + feature loading (cached)
+# Model IO (cached)
 # ----------------------------
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_model_and_features():
-    if not MODEL_PATH.exists():
-        return None, None, False, "Model file missing: Models/rf_fraud_model.joblib"
+    """
+    Loads model + feature columns from disk.
+    Cached so Streamlit doesn't reload constantly.
+    """
+    if not MODEL_PATH.exists() or not FEATURES_PATH.exists():
+        return None, None, False
 
     model = joblib.load(MODEL_PATH)
-
-    # Primary: your saved rf_features.json
-    if FEATURES_PATH.exists():
-        with open(FEATURES_PATH, "r") as f:
-            features = json.load(f)
-        if not isinstance(features, list) or len(features) == 0:
-            return None, None, False, "Models/rf_features.json exists but is empty/invalid."
-        return model, features, True, "Loaded model + rf_features.json"
-
-    # Fallback: sklearn feature_names_in_
-    if hasattr(model, "feature_names_in_"):
-        features = list(model.feature_names_in_)
-        return model, features, True, "Loaded model + feature_names_in_ from sklearn"
-
-    return None, None, False, "No feature list found. Add Models/rf_features.json."
+    with open(FEATURES_PATH, "r", encoding="utf-8") as f:
+        features = json.load(f)
+    return model, features, True
 
 
-def safe_datetime_to_numeric(series: pd.Series) -> pd.Series:
-    """
-    Try parse datetime-like strings into UNIX seconds (float).
-    If not datetime-like, return original series.
-    """
-    if series.dtype != "object":
-        return series
-
-    dt = pd.to_datetime(series, errors="coerce", utc=True)
-    if dt.notna().sum() >= max(3, int(0.10 * len(series))):  # treat as datetime if enough parses
-        return (dt.view("int64") / 1e9).astype("float64")  # seconds
-    return series
+def save_model_and_features(model, features: list[str]):
+    joblib.dump(model, MODEL_PATH)
+    with open(FEATURES_PATH, "w", encoding="utf-8") as f:
+        json.dump(features, f, indent=2)
 
 
-def align_to_training_features(df: pd.DataFrame, features: list) -> pd.DataFrame:
-    """
-    CRITICAL FIX:
-    Ensure scoring dataframe has EXACT same columns + order as training.
-    Converts datetimes to numeric, fills missing cols, drops extras, forces numeric.
-    """
-    X = df.copy()
-
-    # drop target if present
-    X = X.drop(columns=["is_fraud"], errors="ignore")
-
-    # try datetime conversion for object columns
-    for c in X.columns:
-        X[c] = safe_datetime_to_numeric(X[c])
-
-    # add missing training features
-    for col in features:
-        if col not in X.columns:
-            X[col] = 0
-
-    # keep only training columns + correct order
-    X = X[features]
-
-    # numeric cleanup
-    X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
-    X = X.apply(pd.to_numeric, errors="coerce").fillna(0)
-
-    return X
+@st.cache_data(show_spinner=False)
+def list_csvs_in_data_folder():
+    if not DATA_DIR.exists():
+        return []
+    return sorted([p for p in DATA_DIR.glob("*.csv")])
 
 
-def risk_tier(prob: float) -> str:
-    if prob >= 0.80:
+# ----------------------------
+# Training
+# ----------------------------
+def train_rf_from_csv(csv_path: Path, target="is_fraud"):
+    df = pd.read_csv(csv_path)
+
+    if target not in df.columns:
+        raise ValueError(f"Training CSV must include '{target}' column.")
+
+    # Build training matrix (fit without alignment first)
+    X_full, y = featurize(df, training_columns=None, target=target)
+
+    # Save the training columns (critical for scoring later)
+    training_columns = list(X_full.columns)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_full, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    # Balanced RF (good default)
+    model = RandomForestClassifier(
+        n_estimators=500,
+        max_depth=None,
+        min_samples_split=2,
+        n_jobs=-1,
+        class_weight="balanced",
+        random_state=42
+    )
+    model.fit(X_train, y_train)
+
+    # Basic eval
+    probs = model.predict_proba(X_test)[:, 1]
+    roc = roc_auc_score(y_test, probs)
+    pr = average_precision_score(y_test, probs)
+
+    return model, training_columns, {"ROC_AUC": float(roc), "PR_AUC": float(pr), "n_features": len(training_columns)}
+
+
+# ----------------------------
+# Scoring + Risk Tiers
+# ----------------------------
+def risk_tier(prob: float):
+    if prob >= 0.90:
         return "Critical"
-    if prob >= 0.60:
+    if prob >= 0.75:
         return "High"
-    if prob >= 0.35:
+    if prob >= 0.50:
         return "Medium"
     return "Low"
 
 
-def score_transactions(df: pd.DataFrame, model, features: list, threshold: float) -> pd.DataFrame:
-    X = align_to_training_features(df, features)
+def score_transactions(df_in: pd.DataFrame, model, features: list[str], threshold: float):
+    """
+    Scores any CSV (with or without is_fraud).
+    Fixes the Streamlit Cloud error by aligning to saved feature names.
+    """
+    X, _ = featurize(df_in, training_columns=features, target="is_fraud")
     probs = model.predict_proba(X)[:, 1]
 
-    out = df.copy()
+    out = df_in.copy()
     out["fraud_probability"] = probs
-    out["fraud_flag"] = (probs >= threshold).astype(int)
     out["risk_tier"] = [risk_tier(p) for p in probs]
+    out["fraud_flag"] = (out["fraud_probability"] >= threshold).astype(int)
     return out
 
 
+def generate_action_recommendation(row: pd.Series):
+    """
+    Lightweight "AI assistant" messaging.
+    Uses common fraud signals if present; otherwise uses probability + tier.
+    """
+    reasons = []
+    actions = []
+
+    prob = float(row.get("fraud_probability", 0.0))
+    tier = str(row.get("risk_tier", "Low"))
+
+    # Common signals (only if columns exist)
+    if "txn_velocity_1h" in row.index and float(row["txn_velocity_1h"]) >= 5:
+        reasons.append("High transaction velocity in the last 1 hour.")
+    if "txn_velocity_24h" in row.index and float(row["txn_velocity_24h"]) >= 15:
+        reasons.append("High transaction velocity in the last 24 hours.")
+    if "ip_risk_score" in row.index and float(row["ip_risk_score"]) >= 0.7:
+        reasons.append("Elevated IP risk score.")
+    if "device_trust_score" in row.index and float(row["device_trust_score"]) <= 0.2:
+        reasons.append("Low device trust score.")
+    if "location_mismatch" in row.index and int(row["location_mismatch"]) == 1:
+        reasons.append("Location mismatch signal detected.")
+    if "new_device" in row.index and int(row["new_device"]) == 1:
+        reasons.append("New device signal detected.")
+
+    if not reasons:
+        reasons.append(f"Overall risk is {tier} with probability {prob:.3f}.")
+
+    # Actions by tier
+    if tier in ["Critical", "High"]:
+        actions.extend([
+            "Hold transaction and send to manual review.",
+            "Trigger step-up verification (OTP / MFA).",
+            "Check device fingerprint + IP reputation.",
+        ])
+    elif tier == "Medium":
+        actions.extend([
+            "Allow but monitor closely.",
+            "Apply velocity limits and alert if repeated.",
+        ])
+    else:
+        actions.extend([
+            "Allow transaction.",
+            "Log for monitoring and periodic audits.",
+        ])
+
+    return reasons, actions
+
+
+# ----------------------------
+# Sidebar
+# ----------------------------
+st.sidebar.title("🧭 NovaPay Console")
+
+page = st.sidebar.radio(
+    "Navigation",
+    ["Dashboard", "Batch Scoring", "Single Transaction", "Explainability (SHAP)", "Monitoring"],
+    index=0
+)
+
+st.sidebar.markdown("---")
+threshold = st.sidebar.slider("Fraud Threshold", 0.10, 0.99, 0.93, 0.01)
+st.sidebar.caption("Higher threshold = fewer alerts (higher precision). Lower = catch more fraud (higher recall).")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("⚙️ Model Control")
+
+model, features, loaded = load_model_and_features()
+
+csvs = list_csvs_in_data_folder()
+if len(csvs) == 0:
+    st.sidebar.warning("No CSV found in the Data folder yet.")
+    chosen_csv = None
+else:
+    chosen_csv = st.sidebar.selectbox(
+        "Training data source (Data folder)",
+        csvs,
+        format_func=lambda p: p.name
+    )
+
+train_clicked = st.sidebar.button("Train / Refresh Model")
+
+if train_clicked:
+    if chosen_csv is None:
+        st.sidebar.error("Put your training CSV inside the Data folder first (must include is_fraud).")
+    else:
+        with st.sidebar.spinner("Training Random Forest..."):
+            try:
+                new_model, new_features, metrics = train_rf_from_csv(chosen_csv, target="is_fraud")
+                save_model_and_features(new_model, new_features)
+                st.sidebar.success("✅ Model trained & saved successfully.")
+                st.sidebar.info(f"Features: {metrics['n_features']} | ROC_AUC: {metrics['ROC_AUC']:.4f} | PR_AUC: {metrics['PR_AUC']:.4f}")
+                # IMPORTANT: clear cache so app reloads the newly saved model immediately
+                load_model_and_features.clear()
+                model, features, loaded = load_model_and_features()
+            except Exception as e:
+                st.sidebar.error(f"Training failed: {e}")
+
+st.sidebar.markdown("---")
+st.sidebar.caption("📁 Expected folders: Data/, Models/")
+
+
+# ----------------------------
+# KPI helper
+# ----------------------------
 def metric_row(scored_df: pd.DataFrame):
     total = len(scored_df)
     flagged = int((scored_df["fraud_flag"] == 1).sum())
@@ -205,132 +387,17 @@ def metric_row(scored_df: pd.DataFrame):
     return total, flagged, crit, high, avg_prob
 
 
-def generate_action_recommendation(row: pd.Series):
-    """
-    Simple analyst-style explanation rules (fast).
-    Adjust freely.
-    """
-    reasons = []
-    actions = []
-
-    # Common feature names you might have (use whatever exists)
-    def get_any(keys, default=None):
-        for k in keys:
-            if k in row.index:
-                return row[k]
-        return default
-
-    amt = get_any(["amount_usd", "amount_src", "amount"], 0)
-    ip = get_any(["ip_risk_score", "customer_avg_ip_risk"], 0)
-    dev = get_any(["device_trust_score"], 1)
-    v1 = get_any(["txn_velocity_1h"], 0)
-    v24 = get_any(["txn_velocity_24h"], 0)
-
-    if amt is not None and float(amt) > 1000:
-        reasons.append("High transaction amount")
-    if ip is not None and float(ip) > 0.6:
-        reasons.append("Elevated IP risk")
-    if dev is not None and float(dev) < 0.3:
-        reasons.append("Low device trust score")
-    if v1 is not None and float(v1) >= 5:
-        reasons.append("High transaction velocity (1h)")
-    if v24 is not None and float(v24) >= 12:
-        reasons.append("High transaction velocity (24h)")
-
-    if len(reasons) == 0:
-        reasons.append("No strong red flags detected; risk likely driven by combined weak signals.")
-
-    actions.extend([
-        "Verify customer identity (KYC) if flagged",
-        "Check device/IP fingerprint history",
-        "Review recent transaction pattern for velocity spikes",
-        "If confirmed fraud: block device + add to watchlist"
-    ])
-
-    return reasons, actions
-
-
-def build_single_row(features, amount_usd, ip_risk, device_trust, v1, v24, age_days, corridor, loc_mismatch, new_device):
-    """
-    Build a single-row dataframe that matches training features.
-    Strategy:
-      - start with all zeros for training columns
-      - populate common candidate names ONLY if they exist in training features
-    """
-    row = {c: 0 for c in features}
-
-    candidates = {
-        "amount_usd": amount_usd,
-        "amount_src": amount_usd,
-        "amount": amount_usd,
-
-        "ip_risk_score": ip_risk,
-        "customer_avg_ip_risk": ip_risk,
-
-        "device_trust_score": device_trust,
-
-        "txn_velocity_1h": int(v1),
-        "txn_velocity_24h": int(v24),
-
-        "account_age_days": int(age_days),
-
-        "corridor_risk": corridor,
-
-        "location_mismatch": int(loc_mismatch),
-        "new_device": int(new_device),
-    }
-
-    for k, v in candidates.items():
-        if k in row:
-            row[k] = v
-
-    return pd.DataFrame([row])
-
-
 # ----------------------------
-# Streamlit setup
+# Page: Dashboard
 # ----------------------------
-st.set_page_config(page_title="NovaPay | AI Fraud Defense", page_icon="🛡️", layout="wide")
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
-
-model, features, LOADED, load_msg = load_model_and_features()
-
-# Sidebar
-st.sidebar.title("🧭 NovaPay Console")
-
-page = st.sidebar.radio(
-    "Navigation",
-    ["🏠 Dashboard", "🧪 Batch Scoring", "🎯 Single Transaction", "🧠 Explainability"],
-    index=0
-)
-
-st.sidebar.markdown("---")
-threshold = st.sidebar.slider("Fraud Threshold", 0.10, 0.99, 0.93, 0.01)
-st.sidebar.caption("Raise threshold → higher precision, lower recall. Lower threshold → catch more fraud.")
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("⚙️ Model Status")
-if LOADED:
-    st.sidebar.success("Model loaded ✅")
-    st.sidebar.caption(load_msg)
-    st.sidebar.write(f"Training features: **{len(features):,}**")
-else:
-    st.sidebar.error("Model not ready ❌")
-    st.sidebar.caption(load_msg)
-    st.stop()
-
-
-# ----------------------------
-# Dashboard
-# ----------------------------
-if page == "🏠 Dashboard":
+if page == "Dashboard":
     st.markdown(
         """
         <div class="hero">
           <span class="badge">AI-Assisted Fraud Defense</span>
           <h1>🛡️ NovaPay Fraud Defense Platform</h1>
           <div class="smallmuted">
-            Upload transactions • Score fraud probability • Explain decisions • Monitor risk
+            Upload transactions • Score fraud probability • Explain decisions • Monitor drift
           </div>
         </div>
         """,
@@ -343,80 +410,69 @@ if page == "🏠 Dashboard":
         st.markdown('<div class="card"><h3>What this app does</h3>', unsafe_allow_html=True)
         st.write(
             """
-            - Scores transactions with a trained **Random Forest** fraud model
+            - Scores transactions with a **Random Forest** fraud model
             - Produces **risk tiers** (Low → Critical) and recommended actions
-            - Supports analyst review & reporting (CSV export)
+            - Supports analyst review, reporting, and monitoring
             """
         )
         st.markdown("</div>", unsafe_allow_html=True)
 
     with c2:
-        st.markdown('<div class="card"><h3>Model</h3>', unsafe_allow_html=True)
-        st.success("Ready ✅")
-        st.write(f"Loaded feature columns: **{len(features)}**")
-        st.write(f"Default threshold: **{threshold:.2f}**")
+        st.markdown('<div class="card"><h3>Model Status</h3>', unsafe_allow_html=True)
+        if loaded:
+            st.success("Model is ready ✅")
+            st.write(f"Saved feature columns: **{len(features)}**")
+            st.write(f"Model file: `{MODEL_PATH.name}`")
+        else:
+            st.warning("Model not ready yet.")
+            st.write("Train from the sidebar (**Train / Refresh Model**).")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with c3:
         st.markdown('<div class="card"><h3>Quick Start</h3>', unsafe_allow_html=True)
         st.write(
             """
-            1) Go to **Batch Scoring**
-            2) Upload your transactions CSV
-            3) Review **High/Critical** risk
-            4) Download scored output
+            1) Train model (sidebar)
+            2) Go to **Batch Scoring**
+            3) Upload a CSV
+            4) Review Critical/High risk
+            5) Download results
             """
         )
         st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("### 🔎 Demo (optional)")
-    st.caption("If you put a sample CSV in the Data folder, it will show here.")
-
-    demo_files = []
-    if DATA_DIR.exists():
-        demo_files = sorted([p for p in DATA_DIR.glob("*.csv")])
-
-    if len(demo_files) == 0:
-        st.info("No demo CSV found in `Data/`. Add one to preview scoring on the Dashboard.")
-    else:
-        demo_path = st.selectbox("Choose demo CSV", demo_files, format_func=lambda p: p.name)
-        df_demo = pd.read_csv(demo_path)
-
-        with st.spinner("Scoring demo…"):
-            scored_demo = score_transactions(df_demo, model, features, threshold)
-
-        total, flagged, crit, high, avg_prob = metric_row(scored_demo)
-
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Transactions", f"{total:,}")
-        m2.metric("Flagged", f"{flagged:,}")
-        m3.metric("Critical", f"{crit:,}")
-        m4.metric("High", f"{high:,}")
-        m5.metric("Avg Risk", f"{avg_prob:.3f}")
-
-        st.dataframe(scored_demo.head(25), use_container_width=True)
-
-
-# ----------------------------
-# Batch Scoring
-# ----------------------------
-elif page == "🧪 Batch Scoring":
-    st.markdown("## 🧪 Batch Scoring")
-    st.caption("Upload a CSV → score fraud probability → review highest-risk cases → download results.")
-
-    st.markdown(
-        """
-        <div class="panel">
-          <h3>📂 Upload Transactions</h3>
-          <div class="smallmuted">You can upload a raw or engineered CSV. The app will auto-align to training features.</div>
-        </div>
-        """,
-        unsafe_allow_html=True
+    st.markdown("### 📌 Tip for your teacher (Precision=1)")
+    st.info(
+        "Set a **high threshold** (e.g., 0.92–0.98). This often gives **precision≈1** but recall may drop. "
+        "Your screenshot already shows **precision=1** at threshold≈0.925 with recall≈0.839."
     )
 
-    uploaded = st.file_uploader("Upload CSV", type=["csv"], label_visibility="visible")
+
+# ----------------------------
+# Page: Batch Scoring
+# ----------------------------
+elif page == "Batch Scoring":
+    st.markdown("## 🧪 Batch Scoring")
+    st.caption("Upload a CSV → score fraud probability → see KPIs & risk distribution → download results.")
+
+    if not loaded:
+        st.error("Model not ready yet. Train it from the sidebar first.")
+        st.stop()
+
+    uploaded = st.file_uploader("📂 Upload CSV (raw or engineered)", type=["csv"])
+
     if uploaded is None:
-        st.info("Drop a CSV here or click **Browse files** to upload.")
+        st.markdown(
+            """
+            <div class="panel">
+              <h3>📂 No file uploaded yet</h3>
+              <div class="smallmuted">
+                Click <b>Browse files</b> and upload your CSV. The app will align features automatically.
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
         st.stop()
 
     df_in = pd.read_csv(uploaded)
@@ -429,36 +485,23 @@ elif page == "🧪 Batch Scoring":
 
     with right:
         st.markdown("### ⚙️ Options")
-        top_n = st.slider("Show top risky rows", 10, 200, 50, 10)
-        show_only_flagged = st.checkbox("Show only flagged", value=False)
+        top_n = st.slider("Top risky rows to show", 10, 200, 50, 10)
+        show_only_flagged = st.checkbox("Show only flagged fraud", value=False)
 
-        st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
-        note = st.text_area(
-            "Analyst note (optional)",
-            height=90,
-            placeholder="Example: Batch uploaded from settlement pipeline…"
-        )
-
-    with st.spinner("Scoring transactions…"):
+    with st.spinner("Scoring transactions..."):
         scored = score_transactions(df_in, model, features, threshold)
 
-    if note.strip():
-        scored["batch_note"] = note.strip()
-
-    view_df = scored
-    if show_only_flagged:
-        view_df = scored[scored["fraud_flag"] == 1]
-
+    # KPIs
     total, flagged, crit, high, avg_prob = metric_row(scored)
 
     st.markdown(
         f"""
         <div class="kpi-grid">
           <div class="kpi-card"><div class="kpi-title">Transactions</div><div class="kpi-value">{total:,}</div><div class="kpi-sub">Rows scored</div></div>
-          <div class="kpi-card"><div class="kpi-title">Flagged</div><div class="kpi-value">{flagged:,}</div><div class="kpi-sub">threshold {threshold:.2f}</div></div>
-          <div class="kpi-card"><div class="kpi-title">Critical</div><div class="kpi-value">{crit:,}</div><div class="kpi-sub">risk tier</div></div>
-          <div class="kpi-card"><div class="kpi-title">High</div><div class="kpi-value">{high:,}</div><div class="kpi-sub">risk tier</div></div>
-          <div class="kpi-card"><div class="kpi-title">Average Risk</div><div class="kpi-value">{avg_prob:.3f}</div><div class="kpi-sub">mean probability</div></div>
+          <div class="kpi-card"><div class="kpi-title">Flagged</div><div class="kpi-value">{flagged:,}</div><div class="kpi-sub">Threshold {threshold:.2f}</div></div>
+          <div class="kpi-card"><div class="kpi-title">Critical</div><div class="kpi-value">{crit:,}</div><div class="kpi-sub">Risk tier</div></div>
+          <div class="kpi-card"><div class="kpi-title">High</div><div class="kpi-value">{high:,}</div><div class="kpi-sub">Risk tier</div></div>
+          <div class="kpi-card"><div class="kpi-title">Avg Risk</div><div class="kpi-value">{avg_prob:.3f}</div><div class="kpi-sub">Mean probability</div></div>
         </div>
         """,
         unsafe_allow_html=True
@@ -470,10 +513,6 @@ elif page == "🧪 Batch Scoring":
     c1, c2 = st.columns([1, 1.2])
 
     with c1:
-        st.markdown(
-            "<span class='tag'>Low</span><span class='tag'>Medium</span><span class='tag'>High</span><span class='tag'>Critical</span>",
-            unsafe_allow_html=True
-        )
         fig = plt.figure(figsize=(6, 4))
         plt.bar(tier_counts.index.astype(str), tier_counts.values)
         plt.title("Risk Tier Distribution")
@@ -486,10 +525,14 @@ elif page == "🧪 Batch Scoring":
         top_risky = scored.sort_values("fraud_probability", ascending=False).head(top_n)
         st.dataframe(top_risky, use_container_width=True)
 
-    st.markdown("### ✅ Scored Output")
-    st.dataframe(view_df.head(200), use_container_width=True)
+    view_df = scored.copy()
+    if show_only_flagged:
+        view_df = view_df[view_df["fraud_flag"] == 1]
 
-    st.markdown("### ⬇️ Export Results")
+    st.markdown("### 📋 Scored Data (filtered view)")
+    st.dataframe(view_df, use_container_width=True)
+
+    st.markdown("### ⬇️ Download Results")
     colA, colB = st.columns(2)
 
     with colA:
@@ -497,81 +540,80 @@ elif page == "🧪 Batch Scoring":
             "Download FULL scored CSV",
             data=scored.to_csv(index=False).encode("utf-8"),
             file_name="novapay_scored_full.csv",
-            mime="text/csv"
+            mime="text/csv",
         )
-
     with colB:
         flagged_df = scored[scored["fraud_flag"] == 1]
         st.download_button(
-            "Download ONLY flagged",
+            "Download ONLY flagged fraud",
             data=flagged_df.to_csv(index=False).encode("utf-8"),
             file_name="novapay_scored_flagged_only.csv",
-            mime="text/csv"
+            mime="text/csv",
         )
 
-    st.markdown("### 🧾 Quick Summary (copy/paste)")
-    st.code(
-        f"""Batch Summary:
-- Total transactions scored: {total:,}
-- Flagged as fraud (threshold={threshold:.2f}): {flagged:,} ({(flagged/total*100 if total else 0):.2f}%)
-- Critical risk: {crit:,}
-- High risk: {high:,}
-- Average fraud probability: {avg_prob:.3f}
-""",
-        language="text"
-    )
-
 
 # ----------------------------
-# Single Transaction
+# Page: Single Transaction
 # ----------------------------
-elif page == "🎯 Single Transaction":
+elif page == "Single Transaction":
     st.markdown("## 🎯 Single Transaction Scoring")
-    st.caption("Enter key fields → model scores fraud probability → assistant suggests actions.")
+    st.caption("Enter key fields → score probability → assistant explains + shows recommended actions.")
+
+    if not loaded:
+        st.error("Model not ready yet. Train it from the sidebar first.")
+        st.stop()
 
     left, right = st.columns([1.1, 1])
 
     with left:
         st.markdown('<div class="card"><h3>Transaction Inputs</h3>', unsafe_allow_html=True)
-        amount_usd = st.number_input("Amount (USD)", min_value=0.0, value=250.0, step=10.0)
-        ip_risk_score = st.slider("IP risk score", 0.0, 1.0, 0.35, 0.01)
 
-        # you said you can have negative device trust sometimes:
-        # keep UI 0..1 but allow manual override if needed
-        device_trust_score = st.slider("Device trust score", 0.0, 1.0, 0.70, 0.01)
-        allow_negative = st.checkbox("My device_trust_score can be negative", value=False)
-        if allow_negative:
-            device_trust_score = st.number_input("Device trust score (manual)", value=float(device_trust_score), step=0.1)
+        amount_usd = st.number_input("Amount (USD)", min_value=0.0, value=250.0, step=10.0)
+
+        ip_risk_score = st.slider("IP risk score (0–1)", 0.0, 1.0, 0.35, 0.01)
+
+        # IMPORTANT: allow negative device trust score (you said yours is negative)
+        device_trust_score = st.slider("Device trust score (-1 to 1)", -1.0, 1.0, 0.70, 0.01)
 
         account_age_days = st.number_input("Account age (days)", min_value=0, value=120, step=1)
-        txn_velocity_1h = st.number_input("Txn velocity (1h)", min_value=0, value=1, step=1)
-        txn_velocity_24h = st.number_input("Txn velocity (24h)", min_value=0, value=3, step=1)
-        corridor_risk = st.slider("Corridor risk", 0.0, 1.0, 0.25, 0.01)
+
+        txn_velocity_1h = st.number_input("Txn velocity (1 hour)", min_value=0, value=1, step=1)
+        txn_velocity_24h = st.number_input("Txn velocity (24 hours)", min_value=0, value=3, step=1)
+
+        corridor_risk = st.slider("Corridor risk (0–1)", 0.0, 1.0, 0.25, 0.01)
+
         location_mismatch = st.checkbox("Location mismatch?", value=False)
         new_device = st.checkbox("New device?", value=False)
-        run = st.button("🧠 Score transaction")
+
+        run = st.button("🧠 Score Transaction")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with right:
         st.markdown('<div class="card"><h3>AI Assistant</h3>', unsafe_allow_html=True)
-        st.write("Explains the score in simple analyst language.")
+        st.write("This panel explains the decision in simple analyst language.")
         st.markdown("</div>", unsafe_allow_html=True)
 
         if run:
-            row = build_single_row(
-                features,
-                amount_usd, ip_risk_score, device_trust_score,
-                txn_velocity_1h, txn_velocity_24h,
-                account_age_days, corridor_risk,
-                location_mismatch, new_device
-            )
+            # Build a minimal row. featurize() will one-hot + align to saved feature columns.
+            row = pd.DataFrame([{
+                "amount_usd": amount_usd,
+                "amount_src": amount_usd,
+                "ip_risk_score": ip_risk_score,
+                "device_trust_score": device_trust_score,
+                "account_age_days": int(account_age_days),
+                "txn_velocity_1h": int(txn_velocity_1h),
+                "txn_velocity_24h": int(txn_velocity_24h),
+                "corridor_risk": corridor_risk,
+                "location_mismatch": int(location_mismatch),
+                "new_device": int(new_device),
+            }])
 
             scored_one = score_transactions(row, model, features, threshold)
             prob = float(scored_one["fraud_probability"].iloc[0])
             flag = int(scored_one["fraud_flag"].iloc[0])
             tier = str(scored_one["risk_tier"].iloc[0])
 
-            st.markdown("### Result")
+            st.markdown("### ✅ Result")
             st.write(f"**Fraud probability:** `{prob:.4f}`")
             st.write(f"**Risk tier:** **{tier}**  |  **Threshold:** `{threshold:.2f}`")
 
@@ -582,7 +624,7 @@ elif page == "🎯 Single Transaction":
 
             reasons, actions = generate_action_recommendation(scored_one.iloc[0])
 
-            st.markdown("### Why this was flagged (signals)")
+            st.markdown("### Why (signals)")
             for r in reasons:
                 st.write(f"• {r}")
 
@@ -592,47 +634,89 @@ elif page == "🎯 Single Transaction":
 
 
 # ----------------------------
-# Explainability
+# Page: Explainability (SHAP)
 # ----------------------------
-elif page == "🧠 Explainability":
+elif page == "Explainability (SHAP)":
     st.markdown("## 🧠 Explainability (SHAP)")
-    st.caption("Loads saved SHAP artifacts from your notebook (no need for is_fraud column here).")
+    st.caption("Loads precomputed SHAP files from Models/ to avoid slowing the app.")
 
-    if not (SHAP_PATH.exists() and XTEST_PATH.exists()):
+    if not loaded:
+        st.error("Model not ready yet. Train it first.")
+        st.stop()
+
+    if not (SHAP_VALUES_PATH.exists() and XTEST_FOR_SHAP_PATH.exists()):
         st.info(
-            "SHAP artifacts not found in app root.\n\n"
-            "Put these files beside app.py:\n"
+            "SHAP files not found.\n\n"
+            "Put these files inside **Models/**:\n"
             "- shap_values_rf.npy\n"
             "- X_test_for_shap.csv\n\n"
-            "Then redeploy / rerun."
+            "Your SHAP notebook already saves them — just move/copy them into the Models folder."
         )
         st.stop()
 
-    shap_values = np.load(SHAP_PATH, allow_pickle=True)
-    X_test = pd.read_csv(XTEST_PATH)
+    shap_values = np.load(SHAP_VALUES_PATH, allow_pickle=True)
+    X_test = pd.read_csv(XTEST_FOR_SHAP_PATH)
 
-    if shap_values.ndim != 2:
-        st.error(f"Unexpected SHAP array shape: {shap_values.shape}. Expected (n_samples, n_features).")
-        st.stop()
-
-    if X_test.shape[1] != shap_values.shape[1]:
-        st.error(
-            f"Mismatch: X_test has {X_test.shape[1]} columns but SHAP has {shap_values.shape[1]} features.\n"
-            "Make sure X_test_for_shap.csv is the same one used to generate shap_values_rf.npy."
-        )
-        st.stop()
+    st.success("✅ SHAP files loaded.")
+    st.write(f"SHAP shape: `{shap_values.shape}` | X_test shape: `{X_test.shape}`")
 
     st.markdown("### Global Feature Importance (Mean |SHAP|)")
     mean_abs = np.abs(shap_values).mean(axis=0)
     fi = pd.DataFrame({"feature": X_test.columns, "mean_abs_shap": mean_abs}).sort_values("mean_abs_shap", ascending=False)
-    st.dataframe(fi.head(30), use_container_width=True)
+    st.dataframe(fi.head(25), use_container_width=True)
 
-    st.markdown("### Top 20 Features Plot")
-    top20 = fi.head(20).iloc[::-1]  # reverse for barh
-    fig = plt.figure(figsize=(8, 6))
-    plt.barh(top20["feature"], top20["mean_abs_shap"])
+    fig = plt.figure(figsize=(9, 6))
+    top = fi.head(20).iloc[::-1]
+    plt.barh(top["feature"], top["mean_abs_shap"])
     plt.title("Top 20 Features by Mean |SHAP| (Fraud class)")
-    plt.xlabel("Mean |SHAP|")
+    plt.xlabel("Mean |SHAP value|")
     st.pyplot(fig)
 
-    st.caption("For full beeswarm/force plots, keep them in your notebook (best for reports).")
+    st.caption("Tip: Keep full beeswarm/force plots in the notebook (best for reports).")
+
+
+# ----------------------------
+# Page: Monitoring (lightweight)
+# ----------------------------
+elif page == "Monitoring":
+    st.markdown("## 📡 Monitoring")
+    st.caption("Simple baseline vs new data distribution checks (lightweight drift story).")
+
+    if not loaded:
+        st.error("Model not ready yet.")
+        st.stop()
+
+    baseline_csvs = list_csvs_in_data_folder()
+    if len(baseline_csvs) == 0:
+        st.info("Put at least one CSV inside Data/ to use as baseline.")
+        st.stop()
+
+    baseline_path = st.selectbox("Choose baseline CSV (Data folder)", baseline_csvs, format_func=lambda p: p.name)
+    base_df = pd.read_csv(baseline_path).drop(columns=["is_fraud"], errors="ignore")
+
+    new_file = st.file_uploader("Upload NEW CSV to compare", type=["csv"])
+    if new_file is None:
+        st.info("Upload a new dataset to compare distributions.")
+        st.stop()
+
+    new_df = pd.read_csv(new_file).drop(columns=["is_fraud"], errors="ignore")
+
+    # pick common numeric columns
+    common_cols = list(set(base_df.columns).intersection(set(new_df.columns)))
+    base_num = base_df[common_cols].select_dtypes(include=[np.number])
+    new_num = new_df[common_cols].select_dtypes(include=[np.number])
+
+    if base_num.shape[1] == 0:
+        st.info("No common numeric columns found for monitoring.")
+        st.stop()
+
+    col = st.selectbox("Choose numeric feature", list(base_num.columns))
+
+    fig = plt.figure(figsize=(9, 4))
+    plt.hist(base_num[col].dropna(), bins=30, alpha=0.6, label="Baseline")
+    plt.hist(new_num[col].dropna(), bins=30, alpha=0.6, label="New")
+    plt.title(f"Distribution comparison: {col}")
+    plt.legend()
+    st.pyplot(fig)
+
+    st.caption("For production: add PSI/KS tests + scheduled monitoring + alerting.")
