@@ -114,6 +114,11 @@ def prepare_features_for_model(df: pd.DataFrame, target: str = "is_fraud"):
     y = df[target].astype(int).values
     X = df.drop(columns=[target])
 
+    # ID columns should NOT be used as model features
+      ID_COLS = ["transaction_id", "txn_id", "transactionId", "TransactionID"]
+      X = X.drop(columns=[c for c in ID_COLS if c in X.columns], errors="ignore")
+
+
     # Handle timestamp -> time features
     if "timestamp" in X.columns:
         ts = pd.to_datetime(X["timestamp"], errors="coerce", utc=True)
@@ -181,6 +186,9 @@ def risk_tier(prob: float) -> str:
 
 def score_df(df_in: pd.DataFrame, model, features: list[str], threshold: float):
     df = df_in.copy()
+
+    ID_COLS = ["transaction_id", "txn_id", "transactionId", "TransactionID"]
+    df = df.drop(columns=[c for c in ID_COLS if c in df.columns], errors="ignore")
 
     # If user uploads raw data with timestamp/categoricals, we must encode it
     # similarly to training (but WITHOUT target)
@@ -489,6 +497,8 @@ elif page == "🎯 Single Score":
         st.markdown('<div class="card"><h3>Transaction Inputs</h3>', unsafe_allow_html=True)
         amount_usd = st.number_input("Amount (USD)", min_value=0.0, value=250.0, step=10.0)
         ip_risk_score = st.slider("IP risk score", 0.0, 1.0, 0.35, 0.01)
+        transaction_id = st.text_input("Transaction ID", value="TXN-000001")
+
 
         # device_trust_score can be negative in your data, so allow negatives
         device_trust_score = st.slider("Device trust score", -1.0, 1.0, 0.70, 0.01)
@@ -509,6 +519,7 @@ elif page == "🎯 Single Score":
 
         if run:
             row = pd.DataFrame([{
+                "transaction_id": transaction_id,
                 "amount_usd": amount_usd,
                 "amount_src": amount_usd,
                 "ip_risk_score": ip_risk_score,
